@@ -1,19 +1,21 @@
 # Sync Logic
 
+This document describes how `SCDTable.sync()` handles each case when syncing a snapshot.
+
 ## Model
 
 - `valid_from`: inclusive (>=), the date this record became effective
-- `valid_to`: exclusive (<), NULL means "current/forever"
+- `valid_to`: exclusive (<), NULL means current/forever
 - Out-of-order sync supported
 - No separate presence tracking table needed
 
 ## Sync Operations
 
-When `sync(date, df)` is called:
+When `sync(date, df)` is called, each record falls into one of these cases:
 
 ---
 
-### Security IS in incoming snapshot
+### Record IS in incoming snapshot
 
 #### Case 1: Covered, same data
 **Condition**: Record exists where `valid_from <= date` AND (`valid_to > date` OR `valid_to IS NULL`), data identical
@@ -45,19 +47,19 @@ When `sync(date, df)` is called:
 
 **Operation**: Insert new record with:
 - `valid_from = date`
-- `valid_to = earliest synced date after this date where security has no coverage, or NULL`
+- `valid_to = earliest synced date after this date where record has no coverage, or NULL`
 
 ---
 
-#### Case 5: New security (no records exist)
+#### Case 5: New record (no existing SCD records)
 
 **Operation**: Insert record with:
 - `valid_from = date`
-- `valid_to = earliest synced date after this date where security has no coverage, or NULL`
+- `valid_to = earliest synced date after this date where record has no coverage, or NULL`
 
 ---
 
-### Security NOT in incoming snapshot
+### Record NOT in incoming snapshot
 
 #### Case 6: Has covering record
 
@@ -80,15 +82,15 @@ We don't need a separate presence tracking table because:
 1. **sync_metadata** tells us which dates have been synced
 2. **SCD records** tell us coverage ranges
 
-When a record covers a synced date and wasn't closed at that date, the security must have been present when that date was synced.
+When a record covers a synced date and wasn't closed at that date, the record must have been present when that date was synced.
 
 Example:
 - Record (Dec 1, NULL) exists
 - sync_metadata shows Dec 5 was synced
-- If Dec 5 was synced and record still covers it, security was present at Dec 5
-- If security was absent at Dec 5, the record would have been closed at Dec 5
+- If Dec 5 was synced and record still covers it, record was present at Dec 5
+- If record was absent at Dec 5, it would have been closed at Dec 5
 
-This allows correct handling of deletions during out-of-order sync without storing per-security presence.
+This allows correct handling of deletions during out-of-order sync without storing per-record presence.
 
 ---
 

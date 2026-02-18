@@ -24,24 +24,21 @@ P002 | Gadget| 4.99  | 2025-01-01 | NULL        # unchanged
 from scduck import SCDTable
 
 # Define your schema
-db = SCDTable(
+with SCDTable(
     "products.duckdb",
     table="products",
     keys=["product_id"],
     values=["name", "price", "category"]
-)
+) as db:
+    # Sync daily snapshots (pandas, polars, or pyarrow)
+    result = db.sync("2025-01-01", df_jan1)  # returns SyncResult
+    db.sync("2025-01-02", df_jan2)
 
-# Sync daily snapshots (pandas, polars, or pyarrow)
-db.sync("2025-01-01", df_jan1)
-db.sync("2025-01-02", df_jan2)
+    # Reconstruct any historical snapshot
+    snapshot = db.get_data("2025-01-01")  # returns pyarrow Table
 
-# Reconstruct any historical snapshot
-snapshot = db.get_data("2025-01-01")  # returns pyarrow Table
-
-# Check synced dates
-db.get_synced_dates()  # ['2025-01-01', '2025-01-02']
-
-db.close()
+    # Check synced dates
+    db.get_synced_dates()  # ['2025-01-01', '2025-01-02']
 ```
 
 ### Out-of-order sync
@@ -57,18 +54,18 @@ db.get_data("2025-01-01")  # returns correct snapshot
 ## Example: SecurityMaster
 
 ```python
+import pandas as pd
 from scduck import SCDTable
 
-db = SCDTable(
+with SCDTable(
     "security_master.duckdb",
     table="securities",
     keys=["security_id"],
     values=["ticker", "mic", "isin", "description",
             "sub_industry", "country", "currency", "country_risk"]
-)
-
-df = pd.read_csv("SecurityMaster_20251201.csv")
-db.sync("2025-12-01", df)
+) as db:
+    df = pd.read_csv("SecurityMaster_20251201.csv")
+    db.sync("2025-12-01", df)
 ```
 
 ## Installation
