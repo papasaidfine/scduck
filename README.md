@@ -1,6 +1,6 @@
-# SCD Table
+# scduck
 
-Generic SCD Type 2 persistence with DuckDB. Track historical changes to any slowly-changing data without storing redundant snapshots.
+SCD Type 2 tables with DuckDB. Track historical changes to slowly-changing data without storing redundant snapshots.
 
 **13 days of data: 65 MB CSV -> 6.3 MB DuckDB (~10x compression)**
 
@@ -21,7 +21,7 @@ P002 | Gadget| 4.99  | 2025-01-01 | NULL        # unchanged
 ## Usage
 
 ```python
-from scd_table import SCDTable
+from scduck import SCDTable
 
 # Define your schema
 db = SCDTable(
@@ -57,7 +57,7 @@ db.get_data("2025-01-01")  # returns correct snapshot
 ## Example: SecurityMaster
 
 ```python
-from scd_table import SCDTable
+from scduck import SCDTable
 
 db = SCDTable(
     "security_master.duckdb",
@@ -71,10 +71,13 @@ df = pd.read_csv("SecurityMaster_20251201.csv")
 db.sync("2025-12-01", df)
 ```
 
-## Setup
+## Installation
 
 ```bash
-uv add duckdb pyarrow pandas polars
+pip install scduck
+
+# With pandas/polars support
+pip install scduck[all]
 ```
 
 ## Sync Logic
