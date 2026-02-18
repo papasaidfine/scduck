@@ -1,83 +1,80 @@
-# SecurityMaster DuckDB Persistence
+# SCD Table
 
-Lightweight DuckDB-based storage for SecurityMaster snapshots using SCD Type 2. Instead of saving identical CSVs day after day, only changes are stored.
+Generic SCD Type 2 persistence with DuckDB. Track historical changes to any slowly-changing data without storing redundant snapshots.
 
 **13 days of data: 65 MB CSV -> 6.3 MB DuckDB (~10x compression)**
 
 ## How it works
 
-Each security is stored once with a `valid_from` / `valid_to` date range. When data doesn't change between days, no new rows are written. Only new, changed, or deleted securities generate records.
+Records are stored with `valid_from` / `valid_to` date ranges. When data doesn't change, no new rows are written. Only changes generate new records.
 
 ```
-security_id | ticker | country | valid_from | valid_to
-04MXXQYNG9  | AAPL   | US      | 2025-12-01 | NULL        # unchanged since Dec 1
-K9RQE6VQGZ  | AAL    | US      | 2025-12-01 | 2025-12-05  # changed on Dec 5
-K9RQE6VQGZ  | AAL    | US      | 2025-12-05 | NULL        # new version
+id   | name  | price | valid_from | valid_to
+P001 | Widget| 9.99  | 2025-01-01 | 2025-03-15  # original price
+P001 | Widget| 12.99 | 2025-03-15 | NULL        # price changed
+P002 | Gadget| 4.99  | 2025-01-01 | NULL        # unchanged
 ```
 
-Date range semantics: `valid_from` is **inclusive** (>=), `valid_to` is **exclusive** (<). NULL means current/forever.
+- `valid_from`: inclusive (>=)
+- `valid_to`: exclusive (<), NULL = current
 
 ## Usage
 
 ```python
-from security_master_db import SecurityMasterDB
+from scd_table import SCDTable
 
-# Initialize (creates DB file if needed)
-db = SecurityMasterDB("security_master.duckdb")
+# Define your schema
+db = SCDTable(
+    "products.duckdb",
+    table="products",
+    keys=["product_id"],
+    values=["name", "price", "category"]
+)
 
-# Sync a daily snapshot (accepts pandas, polars, or pyarrow)
-df = pd.read_csv("SecurityMaster_20251201.csv")
-result = db.sync("2025-12-01", df)
-# SyncResult(date='2025-12-01', rows_total=57798, rows_new=57798, ...)
+# Sync daily snapshots (pandas, polars, or pyarrow)
+db.sync("2025-01-01", df_jan1)
+db.sync("2025-01-02", df_jan2)
 
-# Reconstruct snapshot for any synced date
-snapshot = db.get_data("2025-12-01")  # returns pyarrow Table
+# Reconstruct any historical snapshot
+snapshot = db.get_data("2025-01-01")  # returns pyarrow Table
 
-# Check what's been synced
-db.get_synced_dates()  # ['2025-12-01', '2025-12-02', ...]
+# Check synced dates
+db.get_synced_dates()  # ['2025-01-01', '2025-01-02']
 
 db.close()
 ```
 
 ### Out-of-order sync
 
-Dates can be synced in any order. The SCD records are adjusted automatically:
+Dates can be synced in any order:
 
 ```python
-db.sync("2025-12-05", dec5_df)  # sync Dec 5 first
-db.sync("2025-12-01", dec1_df)  # then backfill Dec 1
-db.get_data("2025-12-01")       # returns correct snapshot
+db.sync("2025-01-15", df)  # sync Jan 15 first
+db.sync("2025-01-01", df)  # backfill Jan 1
+db.get_data("2025-01-01")  # returns correct snapshot
 ```
 
-## Schema
+## Example: SecurityMaster
 
-```sql
-CREATE TABLE security_master (
-    security_id VARCHAR NOT NULL,
-    ticker VARCHAR,
-    mic VARCHAR,
-    isin VARCHAR,
-    description VARCHAR,
-    sub_industry INTEGER,
-    country VARCHAR,
-    currency VARCHAR,
-    country_risk VARCHAR,
-    valid_from DATE NOT NULL,
-    valid_to DATE,              -- NULL = current
-    PRIMARY KEY (security_id, valid_from)
-);
+```python
+from scd_table import SCDTable
 
-CREATE TABLE sync_metadata (
-    as_of_date DATE PRIMARY KEY,
-    synced_at TIMESTAMP,
-    row_count INTEGER
-);
+db = SCDTable(
+    "security_master.duckdb",
+    table="securities",
+    keys=["security_id"],
+    values=["ticker", "mic", "isin", "description",
+            "sub_industry", "country", "currency", "country_risk"]
+)
+
+df = pd.read_csv("SecurityMaster_20251201.csv")
+db.sync("2025-12-01", df)
 ```
 
 ## Setup
 
 ```bash
-uv init && uv add pandas duckdb pyarrow polars
+uv add duckdb pyarrow pandas polars
 ```
 
 ## Sync Logic

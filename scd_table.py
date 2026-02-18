@@ -1,9 +1,9 @@
 """
-SecurityMaster DuckDB persistence layer.
+Generic SCD Type 2 DuckDB persistence layer.
 
-SCD Type 2 storage:
 - valid_from: inclusive (>=)
 - valid_to: exclusive (<), NULL means current/forever
+- Out-of-order sync supported
 """
 
 from dataclasses import dataclass
@@ -32,45 +32,52 @@ class SyncResult:
     rows_reappeared: int
 
 
-class SecurityMasterDB:
-    """DuckDB-based persistence for SecurityMaster using SCD Type 2."""
+class SCDTable:
+    """Generic SCD Type 2 table with DuckDB backend."""
 
-    KEY_COLS = ["security_id"]
-    VALUE_COLS = ["ticker", "mic", "isin", "description", "sub_industry",
-                  "country", "currency", "country_risk"]
-    ALL_COLS = KEY_COLS + VALUE_COLS
-
-    def __init__(self, db_path: str | Path):
+    def __init__(
+        self,
+        db_path: str | Path,
+        table: str,
+        keys: list[str],
+        values: list[str],
+    ):
         """
-        Initialize connection to DuckDB file.
+        Initialize SCD table.
 
         Args:
-            db_path: Path to the DuckDB file
+            db_path: Path to DuckDB file
+            table: Table name
+            keys: Primary key column(s) for identifying records
+            values: Value columns to track for changes
         """
         self.db_path = Path(db_path)
+        self.table = table
+        self.keys = list(keys)
+        self.values = list(values)
+        self.all_cols = self.keys + self.values
+
         self.conn = duckdb.connect(str(self.db_path))
         self._init_schema()
 
     def _init_schema(self) -> None:
         """Create tables if they don't exist."""
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS security_master (
-                security_id VARCHAR NOT NULL,
-                ticker VARCHAR,
-                mic VARCHAR,
-                isin VARCHAR,
-                description VARCHAR,
-                sub_industry INTEGER,
-                country VARCHAR,
-                currency VARCHAR,
-                country_risk VARCHAR,
+        # Build column definitions (all VARCHAR for simplicity)
+        key_cols = ", ".join(f"{col} VARCHAR NOT NULL" for col in self.keys)
+        value_cols = ", ".join(f"{col} VARCHAR" for col in self.values)
+        pk_cols = ", ".join(self.keys)
+
+        self.conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.table} (
+                {key_cols},
+                {value_cols},
                 valid_from DATE NOT NULL,
                 valid_to DATE,
-                PRIMARY KEY (security_id, valid_from)
+                PRIMARY KEY ({pk_cols}, valid_from)
             )
         """)
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS sync_metadata (
+        self.conn.execute(f"""
+            CREATE TABLE IF NOT EXISTS {self.table}_sync_metadata (
                 as_of_date DATE PRIMARY KEY,
                 synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 row_count INTEGER
@@ -96,7 +103,7 @@ class SecurityMasterDB:
         col_map = {normalize_name(c): c for c in table.column_names}
         arrays = []
         names = []
-        for schema_col in self.ALL_COLS:
+        for schema_col in self.all_cols:
             normalized = normalize_name(schema_col)
             if normalized in col_map:
                 actual_col = col_map[normalized]
@@ -107,159 +114,162 @@ class SecurityMasterDB:
     def sync(self, date: str, df: DataFrameLike) -> SyncResult:
         """
         Sync a snapshot for the given date using SCD Type 2.
-        Uses batch SQL operations for performance.
         """
+        tbl = self.table
+        meta = f"{self.table}_sync_metadata"
+
         table = self._to_arrow(df)
         table = self._normalize_columns(table)
         row_count = table.num_rows
 
-        # Register incoming data
         self.conn.register("_incoming", table)
 
         self.conn.execute("BEGIN TRANSACTION")
         try:
-            value_cols_sql = ", ".join(self.VALUE_COLS)
-
-            # Case 1 & 2: Find covering records (valid_from <= date AND (valid_to > date OR valid_to IS NULL))
+            # Case 1 & 2: Find covering records
             self.conn.execute(f"""
                 CREATE TEMP TABLE _covering AS
                 SELECT
-                    i.security_id,
-                    {', '.join(f'i.{c} as i_{c}' for c in self.VALUE_COLS)},
+                    {', '.join(f'i.{c} as i_{c}' for c in self.all_cols)},
                     sm.valid_from as sm_valid_from,
                     sm.valid_to as sm_valid_to,
-                    {', '.join(f'sm.{c} as sm_{c}' for c in self.VALUE_COLS)}
+                    {', '.join(f'sm.{c} as sm_{c}' for c in self.values)}
                 FROM _incoming i
-                LEFT JOIN security_master sm
-                    ON i.security_id = sm.security_id
+                LEFT JOIN {tbl} sm
+                    ON {' AND '.join(f'i.{k} = sm.{k}' for k in self.keys)}
                     AND sm.valid_from <= DATE '{date}'
                     AND (sm.valid_to > DATE '{date}' OR sm.valid_to IS NULL)
             """)
 
-            # Case 3: Find next records (valid_from > date) for non-covered securities
+            # Case 3: Find next records for non-covered
+            key_cols_i = ', '.join(f'i.{k}' for k in self.keys)
             self.conn.execute(f"""
                 CREATE TEMP TABLE _next AS
-                SELECT DISTINCT ON (i.security_id)
-                    i.security_id,
-                    {', '.join(f'i.{c} as i_{c}' for c in self.VALUE_COLS)},
+                SELECT DISTINCT ON ({key_cols_i})
+                    {', '.join(f'i.{c} as i_{c}' for c in self.all_cols)},
                     sm.valid_from as sm_valid_from,
                     sm.valid_to as sm_valid_to,
-                    {', '.join(f'sm.{c} as sm_{c}' for c in self.VALUE_COLS)}
+                    {', '.join(f'sm.{c} as sm_{c}' for c in self.values)}
                 FROM _incoming i
-                JOIN security_master sm
-                    ON i.security_id = sm.security_id
+                JOIN {tbl} sm
+                    ON {' AND '.join(f'i.{k} = sm.{k}' for k in self.keys)}
                     AND sm.valid_from > DATE '{date}'
-                WHERE i.security_id NOT IN (
-                    SELECT security_id FROM _covering WHERE sm_valid_from IS NOT NULL
+                WHERE ({', '.join(f'i.{k}' for k in self.keys)}) NOT IN (
+                    SELECT {', '.join(f'i_{k}' for k in self.keys)} FROM _covering WHERE sm_valid_from IS NOT NULL
                 )
-                ORDER BY i.security_id, sm.valid_from
+                ORDER BY {key_cols_i}, sm.valid_from
             """)
 
-            # Case 4: Find prev records (valid_to <= date) for non-covered, non-next securities
-            # These are reappearances after deletion
+            # Case 4: Find prev records (reappearance)
             self.conn.execute(f"""
                 CREATE TEMP TABLE _prev AS
-                SELECT DISTINCT ON (i.security_id)
-                    i.security_id,
-                    {', '.join(f'i.{c} as i_{c}' for c in self.VALUE_COLS)}
+                SELECT DISTINCT ON ({key_cols_i})
+                    {', '.join(f'i.{c} as i_{c}' for c in self.all_cols)}
                 FROM _incoming i
-                JOIN security_master sm
-                    ON i.security_id = sm.security_id
+                JOIN {tbl} sm
+                    ON {' AND '.join(f'i.{k} = sm.{k}' for k in self.keys)}
                     AND sm.valid_to <= DATE '{date}'
-                WHERE i.security_id NOT IN (
-                    SELECT security_id FROM _covering WHERE sm_valid_from IS NOT NULL
+                WHERE ({', '.join(f'i.{k}' for k in self.keys)}) NOT IN (
+                    SELECT {', '.join(f'i_{k}' for k in self.keys)} FROM _covering WHERE sm_valid_from IS NOT NULL
                 )
-                AND i.security_id NOT IN (SELECT security_id FROM _next)
-                ORDER BY i.security_id, sm.valid_to DESC
+                AND ({', '.join(f'i.{k}' for k in self.keys)}) NOT IN (
+                    SELECT {', '.join(f'i_{k}' for k in self.keys)} FROM _next
+                )
+                ORDER BY {key_cols_i}, sm.valid_to DESC
             """)
 
-            # Build comparison expression for value columns
+            # Build comparison expression
             same_expr = " AND ".join(
                 f"((i_{c} IS NULL AND sm_{c} IS NULL) OR i_{c} = sm_{c})"
-                for c in self.VALUE_COLS
+                for c in self.values
             )
 
-            # Case 1: Covered, same data -> no change (just count)
+            # Case 1: Unchanged
             unchanged = self.conn.execute(f"""
                 SELECT COUNT(*) FROM _covering
                 WHERE sm_valid_from IS NOT NULL AND ({same_expr})
             """).fetchone()[0]
 
-            # Case 2: Covered, different data -> close old, insert new
+            # Case 2: Changed
             changed_covered = self.conn.execute(f"""
-                SELECT security_id, sm_valid_from, sm_valid_to,
-                       {', '.join(f'i_{c}' for c in self.VALUE_COLS)}
+                SELECT {', '.join(f'i_{k}' for k in self.keys)}, sm_valid_from, sm_valid_to
                 FROM _covering
                 WHERE sm_valid_from IS NOT NULL AND NOT ({same_expr})
             """).fetchdf()
 
-            # Case 3a: Has next record, same data -> extend next backwards
+            # Case 3a: Extend back
             extend_back = self.conn.execute(f"""
-                SELECT security_id, sm_valid_from
+                SELECT {', '.join(f'i_{k}' for k in self.keys)}, sm_valid_from
                 FROM _next WHERE {same_expr}
             """).fetchdf()
 
-            # Case 3b: Has next record, different data -> insert before next
+            # Case 3b: Insert before next
             insert_before_next = self.conn.execute(f"""
-                SELECT security_id, sm_valid_from as next_valid_from,
-                       {', '.join(f'i_{c}' for c in self.VALUE_COLS)}
+                SELECT {', '.join(f'i_{k}' for k in self.keys)}, sm_valid_from as next_valid_from
                 FROM _next WHERE NOT ({same_expr})
             """).fetchdf()
 
-            # Case 4: Reappearance after deletion -> always insert new record
+            # Case 4: Reappearance
             reappeared = self.conn.execute(f"""
-                SELECT security_id, {', '.join(f'i_{c}' for c in self.VALUE_COLS)}
+                SELECT {', '.join(f'i_{k}' for k in self.keys)}
                 FROM _prev
             """).fetchdf()
 
-            # Case 5: Completely new securities
-            new_securities = self.conn.execute(f"""
-                SELECT i.security_id, {', '.join(f'i.{c}' for c in self.VALUE_COLS)}
+            # Case 5: New
+            new_records = self.conn.execute(f"""
+                SELECT {', '.join(f'i.{c}' for c in self.keys)}
                 FROM _incoming i
-                WHERE i.security_id NOT IN (
-                    SELECT security_id FROM _covering WHERE sm_valid_from IS NOT NULL
+                WHERE ({', '.join(f'i.{k}' for k in self.keys)}) NOT IN (
+                    SELECT {', '.join(f'i_{k}' for k in self.keys)} FROM _covering WHERE sm_valid_from IS NOT NULL
                 )
-                AND i.security_id NOT IN (SELECT security_id FROM _next)
-                AND i.security_id NOT IN (SELECT security_id FROM _prev)
+                AND ({', '.join(f'i.{k}' for k in self.keys)}) NOT IN (
+                    SELECT {', '.join(f'i_{k}' for k in self.keys)} FROM _next
+                )
+                AND ({', '.join(f'i.{k}' for k in self.keys)}) NOT IN (
+                    SELECT {', '.join(f'i_{k}' for k in self.keys)} FROM _prev
+                )
             """).fetchdf()
 
-            # Case 6: Deletions - securities with covering record but not in incoming
-            # Capture original valid_to and data for potential re-opening
+            # Case 6: Deletions
             deletions = self.conn.execute(f"""
-                SELECT sm.security_id, sm.valid_from, sm.valid_to,
-                       {', '.join(f'sm.{c}' for c in self.VALUE_COLS)}
-                FROM security_master sm
+                SELECT {', '.join(f'sm.{c}' for c in self.keys)}, sm.valid_from, sm.valid_to,
+                       {', '.join(f'sm.{c}' for c in self.values)}
+                FROM {tbl} sm
                 WHERE sm.valid_from <= DATE '{date}'
                   AND (sm.valid_to > DATE '{date}' OR sm.valid_to IS NULL)
-                  AND sm.security_id NOT IN (SELECT security_id FROM _incoming)
+                  AND ({', '.join(f'sm.{k}' for k in self.keys)}) NOT IN (
+                      SELECT {', '.join(k for k in self.keys)} FROM _incoming
+                  )
             """).fetchdf()
 
-            # Execute batch updates and inserts
+            # Execute updates/inserts
 
-            # Case 2: Close covered records that changed, insert new versions
+            # Case 2: Close and insert new version
             if len(changed_covered) > 0:
+                key_join = ' AND '.join(f'sm.{k} = c.i_{k}' for k in self.keys)
                 self.conn.execute(f"""
-                    UPDATE security_master sm SET valid_to = DATE '{date}'
+                    UPDATE {tbl} sm SET valid_to = DATE '{date}'
                     FROM _covering c
-                    WHERE sm.security_id = c.security_id
+                    WHERE {key_join}
                       AND sm.valid_from = c.sm_valid_from
                       AND c.sm_valid_from IS NOT NULL
                       AND NOT ({same_expr})
                 """)
                 self.conn.execute(f"""
-                    INSERT INTO security_master
-                    SELECT security_id, {', '.join(f'i_{c}' for c in self.VALUE_COLS)},
+                    INSERT INTO {tbl}
+                    SELECT {', '.join(f'i_{c}' for c in self.all_cols)},
                            DATE '{date}', sm_valid_to
                     FROM _covering
                     WHERE sm_valid_from IS NOT NULL AND NOT ({same_expr})
                 """)
 
-            # Case 3a: Extend next records backwards
+            # Case 3a: Extend backwards
             if len(extend_back) > 0:
+                key_join = ' AND '.join(f'sm.{k} = n.i_{k}' for k in self.keys)
                 self.conn.execute(f"""
-                    UPDATE security_master sm SET valid_from = DATE '{date}'
+                    UPDATE {tbl} sm SET valid_from = DATE '{date}'
                     FROM _next n
-                    WHERE sm.security_id = n.security_id
+                    WHERE {key_join}
                       AND sm.valid_from = n.sm_valid_from
                       AND ({same_expr.replace('i_', 'n.i_').replace('sm_', 'n.sm_')})
                 """)
@@ -267,101 +277,105 @@ class SecurityMasterDB:
             # Case 3b: Insert before next
             if len(insert_before_next) > 0:
                 self.conn.execute(f"""
-                    INSERT INTO security_master
-                    SELECT security_id, {', '.join(f'i_{c}' for c in self.VALUE_COLS)},
+                    INSERT INTO {tbl}
+                    SELECT {', '.join(f'i_{c}' for c in self.all_cols)},
                            DATE '{date}', sm_valid_from
                     FROM _next
                     WHERE NOT ({same_expr})
                 """)
 
-            # Case 4: Insert reappeared securities
-            # valid_to = earliest synced date after current where security has no coverage, or NULL
+            # Case 4: Insert reappeared
             if len(reappeared) > 0:
+                key_match = ' AND '.join(f's.{k} = p.i_{k}' for k in self.keys)
                 self.conn.execute(f"""
-                    INSERT INTO security_master
-                    SELECT p.security_id, {', '.join(f'p.i_{c}' for c in self.VALUE_COLS)},
+                    INSERT INTO {tbl}
+                    SELECT {', '.join(f'p.i_{c}' for c in self.all_cols)},
                            DATE '{date}',
                            (SELECT MIN(sm.as_of_date)
-                            FROM sync_metadata sm
+                            FROM {meta} sm
                             WHERE sm.as_of_date > DATE '{date}'
                               AND NOT EXISTS (
-                                  SELECT 1 FROM security_master s
-                                  WHERE s.security_id = p.security_id
+                                  SELECT 1 FROM {tbl} s
+                                  WHERE {key_match}
                                     AND s.valid_from <= sm.as_of_date
                                     AND (s.valid_to > sm.as_of_date OR s.valid_to IS NULL)
                               ))
                     FROM _prev p
                 """)
 
-            # Case 5: Insert new securities
-            # valid_to = earliest synced date after current where security has no coverage, or NULL
-            if len(new_securities) > 0:
+            # Case 5: Insert new
+            if len(new_records) > 0:
+                key_match = ' AND '.join(f's.{k} = i.{k}' for k in self.keys)
                 self.conn.execute(f"""
-                    INSERT INTO security_master
-                    SELECT i.security_id, {', '.join(f'i.{c}' for c in self.VALUE_COLS)},
+                    INSERT INTO {tbl}
+                    SELECT {', '.join(f'i.{c}' for c in self.all_cols)},
                            DATE '{date}',
                            (SELECT MIN(sm.as_of_date)
-                            FROM sync_metadata sm
+                            FROM {meta} sm
                             WHERE sm.as_of_date > DATE '{date}'
                               AND NOT EXISTS (
-                                  SELECT 1 FROM security_master s
-                                  WHERE s.security_id = i.security_id
+                                  SELECT 1 FROM {tbl} s
+                                  WHERE {key_match}
                                     AND s.valid_from <= sm.as_of_date
                                     AND (s.valid_to > sm.as_of_date OR s.valid_to IS NULL)
                               ))
                     FROM _incoming i
-                    WHERE i.security_id NOT IN (
-                        SELECT security_id FROM _covering WHERE sm_valid_from IS NOT NULL
+                    WHERE ({', '.join(f'i.{k}' for k in self.keys)}) NOT IN (
+                        SELECT {', '.join(f'i_{k}' for k in self.keys)} FROM _covering WHERE sm_valid_from IS NOT NULL
                     )
-                    AND i.security_id NOT IN (SELECT security_id FROM _next)
-                    AND i.security_id NOT IN (SELECT security_id FROM _prev)
+                    AND ({', '.join(f'i.{k}' for k in self.keys)}) NOT IN (
+                        SELECT {', '.join(f'i_{k}' for k in self.keys)} FROM _next
+                    )
+                    AND ({', '.join(f'i.{k}' for k in self.keys)}) NOT IN (
+                        SELECT {', '.join(f'i_{k}' for k in self.keys)} FROM _prev
+                    )
                 """)
 
-            # Case 6: Close deleted records and re-open from next synced date if needed
+            # Case 6: Close deletions and re-open if needed
             if len(deletions) > 0:
-                # Close the records
                 self.conn.execute(f"""
-                    UPDATE security_master sm SET valid_to = DATE '{date}'
+                    UPDATE {tbl} sm SET valid_to = DATE '{date}'
                     WHERE sm.valid_from <= DATE '{date}'
                       AND (sm.valid_to > DATE '{date}' OR sm.valid_to IS NULL)
-                      AND sm.security_id NOT IN (SELECT security_id FROM _incoming)
+                      AND ({', '.join(f'sm.{k}' for k in self.keys)}) NOT IN (
+                          SELECT {', '.join(k for k in self.keys)} FROM _incoming
+                      )
                 """)
 
-                # Re-open from the next synced date that was covered by the original record
-                # If a synced date was covered and the record survived, the security was present
+                # Re-open from next synced date if covered
                 self.conn.register("_deletions", deletions)
+                key_match = ' AND '.join(f's.{k} = d.{k}' for k in self.keys)
                 self.conn.execute(f"""
-                    INSERT INTO security_master
+                    INSERT INTO {tbl}
                     SELECT
-                        d.security_id,
-                        {', '.join(f'd.{c}' for c in self.VALUE_COLS)},
+                        {', '.join(f'd.{c}' for c in self.all_cols)},
                         sm.as_of_date,
                         d.valid_to
                     FROM _deletions d
-                    JOIN sync_metadata sm
+                    JOIN {meta} sm
                         ON sm.as_of_date > DATE '{date}'
                         AND (d.valid_to IS NULL OR sm.as_of_date < d.valid_to)
                     WHERE NOT EXISTS (
-                        SELECT 1 FROM security_master s
-                        WHERE s.security_id = d.security_id
+                        SELECT 1 FROM {tbl} s
+                        WHERE {key_match}
                           AND s.valid_from = sm.as_of_date
                     )
                     AND sm.as_of_date = (
                         SELECT MIN(sm2.as_of_date)
-                        FROM sync_metadata sm2
+                        FROM {meta} sm2
                         WHERE sm2.as_of_date > DATE '{date}'
                           AND (d.valid_to IS NULL OR sm2.as_of_date < d.valid_to)
                     )
                 """)
                 self.conn.unregister("_deletions")
 
-            # Update sync metadata
-            self.conn.execute("""
-                INSERT OR REPLACE INTO sync_metadata (as_of_date, synced_at, row_count)
+            # Update metadata
+            self.conn.execute(f"""
+                INSERT OR REPLACE INTO {meta} (as_of_date, synced_at, row_count)
                 VALUES (?, ?, ?)
             """, [date, datetime.now(), row_count])
 
-            # Cleanup temp tables
+            # Cleanup
             self.conn.execute("DROP TABLE IF EXISTS _covering")
             self.conn.execute("DROP TABLE IF EXISTS _next")
             self.conn.execute("DROP TABLE IF EXISTS _prev")
@@ -376,7 +390,7 @@ class SecurityMasterDB:
         return SyncResult(
             date=date,
             rows_total=row_count,
-            rows_new=len(new_securities),
+            rows_new=len(new_records),
             rows_changed=len(changed_covered) + len(insert_before_next),
             rows_deleted=len(deletions),
             rows_unchanged=unchanged,
@@ -385,25 +399,25 @@ class SecurityMasterDB:
         )
 
     def get_data(self, date: str) -> pa.Table:
-        """Reconstruct snapshot for a date."""
-        return self.conn.execute("""
-            SELECT security_id, ticker, mic, isin, description,
-                   sub_industry, country, currency, country_risk
-            FROM security_master
+        """Get snapshot for a date."""
+        cols = ", ".join(self.all_cols)
+        return self.conn.execute(f"""
+            SELECT {cols}
+            FROM {self.table}
             WHERE valid_from <= ?
               AND (valid_to > ? OR valid_to IS NULL)
         """, [date, date]).fetch_arrow_table()
 
     def get_synced_dates(self) -> list[str]:
         """Return list of synced dates."""
-        result = self.conn.execute(
-            "SELECT as_of_date FROM sync_metadata ORDER BY as_of_date"
-        ).fetchall()
+        result = self.conn.execute(f"""
+            SELECT as_of_date FROM {self.table}_sync_metadata ORDER BY as_of_date
+        """).fetchall()
         return [str(row[0])[:10] for row in result]
 
     def get_record_count(self) -> int:
-        """Return total number of records."""
-        return self.conn.execute("SELECT COUNT(*) FROM security_master").fetchone()[0]
+        """Return total number of SCD records."""
+        return self.conn.execute(f"SELECT COUNT(*) FROM {self.table}").fetchone()[0]
 
     def close(self) -> None:
         """Close the database connection."""

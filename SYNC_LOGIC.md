@@ -1,4 +1,4 @@
-# SecurityMaster Sync Logic
+# Sync Logic
 
 ## Model
 
@@ -95,16 +95,16 @@ This allows correct handling of deletions during out-of-order sync without stori
 ## Example: Out-of-order with deletion
 
 ```
-Sync Dec 17: AAPL present
+Sync Dec 17: Record X present
   → Case 5: INSERT (Dec 17, NULL)
 
-Sync Dec 1: AAPL present, same data
+Sync Dec 1: Record X present, same data
   → Case 3a: Extend backwards (Dec 1, NULL)
 
-Sync Dec 5: AAPL present
+Sync Dec 5: Record X present
   → Case 1: Covered, unchanged
 
-Sync Dec 3: AAPL NOT present
+Sync Dec 3: Record X NOT present
   → Case 6: Close at Dec 3: (Dec 1, Dec 3)
   → Re-open from next synced date (Dec 5): INSERT (Dec 5, NULL)
 
