@@ -284,19 +284,30 @@ class SCDTable:
         same = sql["same_values"]
         select_cols = sql["select_i_cols"]
 
-        # Case 2: Close old record and insert changed version
+        # Case 2: Handle changed records
         if stats["changed_count"] > 0:
             key_join = " AND ".join(f"sm.{k} = c.i_{k}" for k in self.keys)
+            value_updates = ", ".join(f"{v} = c.i_{v}" for v in self.values)
+
+            # Case 2a: Same date re-sync - update values in place
+            self.conn.execute(f"""
+                UPDATE {tbl} sm SET {value_updates}
+                FROM _covering c
+                WHERE {key_join} AND sm.valid_from = c.sm_valid_from
+                  AND c.sm_valid_from = DATE '{date}' AND NOT ({same})
+            """)
+
+            # Case 2b: Different date - close old record and insert new
             self.conn.execute(f"""
                 UPDATE {tbl} sm SET valid_to = DATE '{date}'
                 FROM _covering c
                 WHERE {key_join} AND sm.valid_from = c.sm_valid_from
-                  AND c.sm_valid_from IS NOT NULL AND NOT ({same})
+                  AND c.sm_valid_from < DATE '{date}' AND NOT ({same})
             """)
             self.conn.execute(f"""
                 INSERT INTO {tbl}
                 SELECT {select_cols}, DATE '{date}', sm_valid_to
-                FROM _covering WHERE sm_valid_from IS NOT NULL AND NOT ({same})
+                FROM _covering WHERE sm_valid_from < DATE '{date}' AND NOT ({same})
             """)
 
         # Case 3a: Extend next record backwards
