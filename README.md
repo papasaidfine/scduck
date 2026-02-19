@@ -1,8 +1,6 @@
 # scduck
 
-Store time series of snapshots in a SCD Type 2 table.
-
-**13 days of data: 65 MB CSV -> 6.3 MB DuckDB (~10x compression)**
+Store time series of snapshots in a SCD Type 2 table. Only changes are stored — unchanged records are not duplicated.
 
 ## How it works
 
