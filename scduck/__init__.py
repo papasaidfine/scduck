@@ -7,4 +7,4 @@ Track historical changes to slowly-changing data without storing redundant snaps
 from .table import DataFrameLike, SCDTable, SyncResult
 
 __all__ = ["SCDTable", "SyncResult", "DataFrameLike"]
-__version__ = "0.1.0"
+__version__ = "0.1.1"

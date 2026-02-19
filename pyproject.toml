@@ -1,12 +1,12 @@
 [project]
 name = "scduck"
-version = "0.1.0"
+version = "0.1.1"
 description = "SCD Type 2 tables with DuckDB. Track historical changes to slowly-changing data."
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
 authors = [
-    {name = "Larry Chen", email = "lchen@wolferesearch.com"}
+    {name = "papasaidfine"}
 ]
 keywords = ["scd", "duckdb", "temporal", "history", "data-warehouse", "slowly-changing-dimension"]
 classifiers = [

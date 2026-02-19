@@ -1,6 +1,6 @@
 # scduck
 
-SCD Type 2 tables with DuckDB. Track historical changes to slowly-changing data without storing redundant snapshots.
+Store time series of snapshots in a SCD Type 2 table.
 
 **13 days of data: 65 MB CSV -> 6.3 MB DuckDB (~10x compression)**
 
